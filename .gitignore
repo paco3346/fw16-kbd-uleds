@@ -1,0 +1,18 @@
+# Binary output from Makefile
+fw16-kbd-uleds
+
+# Object files
+*.o
+
+# Arch Linux / makepkg artifacts
+/src/
+/pkg/
+*.tar.gz
+*.tar.xz
+*.tar.zst
+*.log
+
+# Common editor backups
+*~
+*.swp
+.DS_Store
