@@ -16,3 +16,4 @@ fw16-kbd-uleds
 *~
 *.swp
 .DS_Store
+.idea/
