@@ -7,7 +7,7 @@ UNITDIR ?= $(PREFIX)/lib/systemd/system
 TARGET := fw16-kbd-uleds
 SRC := fw16-kbd-uleds.c
 
-CFLAGS ?= -O2 -pipe
+CFLAGS += -Wall -Wextra
 CPPFLAGS ?=
 LDFLAGS ?=
 
@@ -21,6 +21,7 @@ $(TARGET): $(SRC)
 install: $(TARGET)
 	install -Dm755 $(TARGET) "$(DESTDIR)$(BINDIR)/$(TARGET)"
 	install -Dm644 fw16-kbd-uleds.service "$(DESTDIR)$(UNITDIR)/fw16-kbd-uleds.service"
+	install -Dm644 LICENSE "$(DESTDIR)$(PREFIX)/share/licenses/$(TARGET)/LICENSE"
 
 clean:
 	rm -f $(TARGET)
