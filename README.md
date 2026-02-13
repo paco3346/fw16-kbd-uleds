@@ -37,6 +37,15 @@ sudo systemctl enable --now fw16-kbd-uleds.service
 ```
 The service unit automatically ensures the `uleds` kernel module is loaded.
 
+## Desktop Environment Integration
+
+Because this daemon instantiates a virtual LED device via the `uleds` kernel module, `upower` may need to be restarted to enumerate the new `framework::kbd_backlight` class device. For KDE Plasma users, restarting the `plasma-powerdevil` service ensures that the desktop environment picks up the new backlight control.
+
+```bash
+sudo systemctl restart upower
+systemctl --user restart plasma-powerdevil
+```
+
 ## Debugging
 
 You can control the logging verbosity using the `FW16_KBD_ULEDS_DEBUG` environment variable:
