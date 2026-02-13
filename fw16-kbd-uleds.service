@@ -1,0 +1,24 @@
+[Unit]
+Description=Framework 16 keyboard uleds bridge (framework::kbd_backlight -> qmk_hid)
+After=local-fs.target systemd-modules-load.service
+Before=display-manager.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+ExecStartPre=/usr/bin/modprobe uleds
+Environment=FW16_KBD_ULEDS_DEBUG=0
+ExecStart=/usr/bin/fw16-kbd-uleds
+Restart=on-failure
+RestartSec=1s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
