@@ -9,6 +9,7 @@ User=root
 Group=root
 
 ExecStartPre=/usr/bin/modprobe uleds
+EnvironmentFile=-/etc/fw16-kbd-uleds.conf
 Environment=FW16_KBD_ULEDS_DEBUG=0
 ExecStart=/usr/bin/fw16-kbd-uleds
 Restart=on-failure

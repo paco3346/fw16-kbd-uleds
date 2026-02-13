@@ -301,6 +301,21 @@ static int uevent_maybe_relevant(const char *buf, ssize_t len) {
 }
 
 /* -------------------- CLI -------------------- */
+static void usage(const char *prog) {
+    fprintf(stderr, "Usage: %s [options]\n", prog);
+    fprintf(stderr, "\nOptions:\n");
+    fprintf(stderr, "  -m, --mode <mode>              Operation mode: 'auto' (default) or 'unified'\n");
+    fprintf(stderr, "  -v, --vid <hex>                Vendor ID of the keyboard (default: 32ac)\n");
+    fprintf(stderr, "  -d, --debounce-ms <ms>         Debounce time in milliseconds (default: 180)\n");
+    fprintf(stderr, "  -b, --max-brightness <val>     Maximum brightness value (default: 100)\n");
+    fprintf(stderr, "  -h, --help                     Show this help message\n");
+    fprintf(stderr, "\nEnvironment Variables:\n");
+    fprintf(stderr, "  FW16_KBD_ULEDS_DEBUG           Debug level: 0 (default), 1 (info), 2 (verbose)\n");
+    fprintf(stderr, "  FW16_KBD_ULEDS_MODE            Same as --mode\n");
+    fprintf(stderr, "  FW16_KBD_ULEDS_VID             Same as --vid\n");
+    fprintf(stderr, "  FW16_KBD_ULEDS_DEBOUNCE_MS     Same as --debounce-ms\n");
+    fprintf(stderr, "  FW16_KBD_ULEDS_MAX_BRIGHTNESS  Same as --max-brightness\n");
+}
 
 typedef enum {
     FW_MODE_AUTO = 0,
@@ -322,21 +337,37 @@ int main(int argc, char **argv) {
     unsigned debounce_ms = 180;
     unsigned max_brightness = 100;
 
+    // Load from environment first
+    const char *env_mode = getenv("FW16_KBD_ULEDS_MODE");
+    if (env_mode) mode = parse_mode(env_mode);
+
+    const char *env_vid = getenv("FW16_KBD_ULEDS_VID");
+    if (env_vid) vid = (uint16_t)strtoul(env_vid, NULL, 16);
+
+    const char *env_debounce = getenv("FW16_KBD_ULEDS_DEBOUNCE_MS");
+    if (env_debounce) debounce_ms = (unsigned)strtoul(env_debounce, NULL, 10);
+
+    const char *env_max_brightness = getenv("FW16_KBD_ULEDS_MAX_BRIGHTNESS");
+    if (env_max_brightness) max_brightness = (unsigned)strtoul(env_max_brightness, NULL, 10);
+
     static struct option opts[] = {
         {"mode", required_argument, 0, 'm'},
         {"vid", required_argument, 0, 'v'},
         {"debounce-ms", required_argument, 0, 'd'},
         {"max-brightness", required_argument, 0, 'b'},
+        {"help", no_argument, 0, 'h'},
         {0,0,0,0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "m:v:d:b:", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "m:v:d:b:h", opts, NULL)) != -1) {
         switch (c) {
             case 'm': mode = parse_mode(optarg); break;
             case 'v': vid = (uint16_t)strtoul(optarg, NULL, 16); break;
             case 'd': debounce_ms = (unsigned)strtoul(optarg, NULL, 10); break;
             case 'b': max_brightness = (unsigned)strtoul(optarg, NULL, 10); break;
+            case 'h': usage(argv[0]); return 0;
+            default: usage(argv[0]); return 1;
         }
     }
     if (max_brightness == 0) max_brightness = 100;
