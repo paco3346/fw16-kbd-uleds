@@ -1,6 +1,6 @@
 pkgbase = fw16-kbd-uleds-git
 	pkgdesc = Framework 16 keyboard uleds bridge to qmk_hid (framework::kbd_backlight) - Git version
-	pkgver = r3.9869f1a
+	pkgver = r4.317628a
 	pkgrel = 1
 	url = https://github.com/paco3346/fw16-kbd-uleds
 	arch = x86_64
