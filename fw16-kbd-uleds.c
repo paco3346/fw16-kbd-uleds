@@ -120,7 +120,7 @@ static unsigned decode_uleds(const unsigned char *buf, ssize_t r) {
 typedef struct {
     uint16_t vid;
     uint16_t pid;
-    char hidraw[64];
+    char hidraw[256];
 } target_t;
 
 typedef struct {
@@ -148,7 +148,7 @@ static int target_in_list(const target_t *list, size_t len, const target_t *t) {
 
 static int qmk_hidraw_xfer(const char *hidraw, unsigned char cmd, unsigned char channel, unsigned char addr, unsigned char val, unsigned char *resp) {
     if (!hidraw || !*hidraw) return -1;
-    char path[128];
+    char path[512];
     snprintf(path, sizeof(path), "/dev/%s", hidraw);
     int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return -1;
@@ -221,14 +221,16 @@ static void update_sysfs_brightness(const char *name, unsigned val) {
         if (fd >= 0) {
             char buf[16];
             int n = snprintf(buf, sizeof(buf), "%u\n", val);
-            (void)write(fd, buf, n);
+            ssize_t nw = write(fd, buf, n);
+            (void)nw;
             close(fd);
 
             // Trigger uevent so Powerdevil/UPower notice the change
             snprintf(path, sizeof(path), "/sys/class/leds/%s/uevent", name);
             fd = open(path, O_WRONLY);
             if (fd >= 0) {
-                (void)write(fd, "change\n", 7);
+                ssize_t uw = write(fd, "change\n", 7);
+                (void)uw;
                 close(fd);
             }
             return;

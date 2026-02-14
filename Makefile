@@ -7,9 +7,9 @@ UNITDIR ?= $(PREFIX)/lib/systemd/system
 TARGET := fw16-kbd-uleds
 SRC := fw16-kbd-uleds.c
 
-CFLAGS += -Wall -Wextra $(shell pkg-config --cflags libsystemd 2>/dev/null)
+override CFLAGS += -Wall -Wextra $(shell pkg-config --cflags libsystemd 2>/dev/null)
 CPPFLAGS ?=
-LDFLAGS += $(shell pkg-config --libs libsystemd 2>/dev/null)
+override LDFLAGS += $(shell pkg-config --libs libsystemd 2>/dev/null)
 
 .PHONY: all clean install uninstall
 
