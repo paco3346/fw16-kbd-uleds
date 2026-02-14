@@ -2,12 +2,12 @@
 pkgname=fw16-kbd-uleds-git
 pkgver=0
 pkgrel=1
-pkgdesc="Framework 16 keyboard uleds bridge to qmk_hid (framework::kbd_backlight) - Git version"
+pkgdesc="Framework 16 keyboard backlight bridge for KDE/UPower - Git version"
 arch=('x86_64')
 url="https://github.com/paco3346/fw16-kbd-uleds"
 license=('MIT')
-depends=('glibc' 'systemd' 'qmk-hid')
-makedepends=('git')
+depends=('glibc' 'systemd-libs')
+makedepends=('git' 'pkgconf')
 provides=("${pkgname%-git}")
 conflicts=("${pkgname%-git}")
 source=("${pkgname%-git}::git+${url}.git")
@@ -20,7 +20,7 @@ pkgver() {
 
 build() {
   cd "${pkgname%-git}"
-  make CFLAGS="${CFLAGS}" LDFLAGS="${LDFLAGS}"
+  make CPPFLAGS="${CPPFLAGS}" CFLAGS="${CFLAGS}" LDFLAGS="${LDFLAGS}"
 }
 
 package() {
