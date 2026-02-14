@@ -1,6 +1,6 @@
 pkgbase = fw16-kbd-uleds-git
 	pkgdesc = Framework 16 keyboard backlight bridge for KDE/UPower - Git version
-	pkgver = r9.ab52ec8
+	pkgver = r10.c5b67e0
 	pkgrel = 1
 	url = https://github.com/paco3346/fw16-kbd-uleds
 	arch = x86_64
