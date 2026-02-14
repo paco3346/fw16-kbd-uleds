@@ -272,10 +272,12 @@ static void sync_ui(unsigned level) {
     DIR *d = opendir("/run/user");
     if (d) {
         struct dirent *de;
+        int found_users = 0;
         while ((de = readdir(d))) {
             if (de->d_name[0] == '.') continue;
             uid_t uid = (uid_t)atoi(de->d_name);
             if (uid == 0) continue;
+            found_users++;
 
             char socket_path[512];
             snprintf(socket_path, sizeof(socket_path), "/run/user/%u/bus", uid);
@@ -312,7 +314,12 @@ static void sync_ui(unsigned level) {
                 exit(0);
             }
         }
+        if (found_users == 0 && g_debug_level >= 3) {
+            dbg(3, "  PowerDevil sync: no users found in /run/user\n");
+        }
         closedir(d);
+    } else if (g_debug_level >= 3) {
+        dbg(3, "  PowerDevil sync: failed to opendir /run/user: %s\n", strerror(errno));
     }
 }
 
