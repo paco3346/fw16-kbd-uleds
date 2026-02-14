@@ -8,14 +8,15 @@ Brightness changes from the desktop environment are translated into calls to `qm
 ## Features
 
 - **Auto-detection**: Automatically finds FW16 keyboard and input modules.
+- **Hardware Sync**: Reads the current backlight level on startup and monitors for changes made via hardware shortcuts (e.g., `Fn + Space`), keeping the system UI and all modules in sync.
 - **Hotplug Support**: Uses `NETLINK_KOBJECT_UEVENT` to handle module changes at runtime.
-- **Debouncing**: Avoids excessive calls to `qmk_hid` during rapid brightness changes.
 - **Configurable Logging**: Adjustable debug levels via environment variables.
 
 ## Requirements
 
 - Linux kernel with `uleds` module support.
 - `qmk_hid` installed at `/usr/bin/qmk_hid`.
+- `libsystemd` (for D-Bus synchronization).
 - `systemd` (for the provided service unit).
 
 ## Installation
@@ -47,10 +48,10 @@ The daemon can be configured via command-line options, environment variables, or
 |:---|:---|:---|:---|
 | `-m, --mode` | `FW16_KBD_ULEDS_MODE` | Operation mode: `unified` or `separate` | `unified` |
 | `-v, --vid` | `FW16_KBD_ULEDS_VID` | Comma-separated VIDs or `VID:PID` (hex) | `32ac` |
-| `-d, --debounce-ms` | `FW16_KBD_ULEDS_DEBOUNCE_MS` | Debounce time in milliseconds | `180` |
-| `-b, --max-brightness` | `FW16_KBD_ULEDS_MAX_BRIGHTNESS` | Maximum brightness value | `100` |
+| `-b, --max-brightness` | `FW16_KBD_ULEDS_MAX_BRIGHTNESS` | Maximum brightness value | `3` |
+| `-p, --poll-ms` | `FW16_KBD_ULEDS_POLL_MS` | Hardware polling interval in ms | `1000` |
 | `-l, --list` | | List auto-discovered devices and exit | |
-| | `FW16_KBD_ULEDS_DEBUG` | Debug level: `0` (Quiet), `1` (Info), `2` (Verbose) | `0` |
+| | `FW16_KBD_ULEDS_DEBUG` | Debug level: `0` (Quiet), `1` (Info), `2` (Verbose), `3` (D-Bus) | `0` |
 
 ### Operation Modes
 
@@ -63,6 +64,21 @@ The mode determines how detected modules are presented to the system:
   - `framework::numpad_backlight` (Numpad)
   - `framework::macropad_backlight` (Macropad)
   - While this mode exposes all modules to the system, Powerdevil will likely only "see" one of them (usually the main keyboard). Use this mode only if you plan to manage the modules via custom scripts or other tools.
+
+### Hardware Synchronization
+
+The daemon periodically polls the hardware for its current backlight level. This enables two important features:
+
+1.  **Startup Persistence**: On startup, the daemon reads the current backlight level from the modules and initializes the virtual LED device with that value. This prevents the backlight from being reset to 0 when the service starts.
+2.  **Bi-directional Sync**: If you change the backlight level using hardware shortcuts (like `Fn + Space`), the daemon detects this change and:
+    -   Updates the virtual LED device in sysfs.
+    -   Notifies UPower (via D-Bus) and KDE Plasma's PowerDevil service to ensure the UI slider and OSD immediately reflect the new brightness level.
+    -   In `unified` mode, it automatically propagates the change from the main keyboard to all other connected modules (e.g., syncing the numpad).
+    -   In `separate` mode, each virtual device is polled and managed independently.
+
+### Discrete Brightness Levels
+
+The Framework 16 keyboard modules support 4 discrete brightness levels (Off, 33%, 67%, 100%). To provide the best experience with desktop environments like KDE, the daemon defaults to a `max_brightness` of `3`. This results in 4 fixed steps in the UI, avoiding a continuous range slider that doesn't map 1:1 to the hardware capability.
 
 ### Auto-Discovery and Target Overrides
 
@@ -94,7 +110,7 @@ The systemd service unit is configured to load an environment file from `/etc/fw
 Example `/etc/fw16-kbd-uleds.conf`:
 ```env
 FW16_KBD_ULEDS_DEBUG=1
-FW16_KBD_ULEDS_DEBOUNCE_MS=200
+FW16_KBD_ULEDS_MODE=unified
 ```
 
 After modifying the configuration file, restart the service:
@@ -112,15 +128,6 @@ Add the following to the file:
 ```ini
 [Service]
 Environment=FW16_KBD_ULEDS_DEBUG=2
-```
-
-## Desktop Environment Integration
-
-Because this daemon instantiates a virtual LED device via the `uleds` kernel module, `upower` may need to be restarted to enumerate the new `framework::kbd_backlight` class device. For KDE Plasma users, restarting the `plasma-powerdevil` service ensures that the desktop environment picks up the new backlight control.
-
-```bash
-sudo systemctl restart upower
-systemctl --user restart plasma-powerdevil
 ```
 
 ## License

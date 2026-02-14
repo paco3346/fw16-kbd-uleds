@@ -17,7 +17,7 @@
 // Debug levels (runtime):
 //   FW16_KBD_ULEDS_DEBUG=0   (default) quiet
 //   FW16_KBD_ULEDS_DEBUG=1   info: device discovery, hotplug changes, target list changes
-//   FW16_KBD_ULEDS_DEBUG=2   verbose: also logs brightness events, debounce/apply details
+//   FW16_KBD_ULEDS_DEBUG=2   verbose: also logs brightness events, apply details
 //
 // Build:
 //   cc -O2 -Wall -Wextra -Wpedantic -std=c11 -o fw16-kbd-uleds fw16-kbd-uleds.c
@@ -38,6 +38,8 @@
 #include <linux/netlink.h>
 #include <linux/uleds.h>
 #include <poll.h>
+#include <pwd.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -45,7 +47,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <systemd/sd-bus.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -60,7 +64,7 @@ static int debug_level(void) {
     long v = strtol(e, &end, 10);
     if (end == e) return 0;
     if (v < 0) v = 0;
-    if (v > 2) v = 2;
+    if (v > 3) v = 3;
     return (int)v;
 }
 
@@ -87,17 +91,17 @@ static unsigned clamp_pct(unsigned v) {
 
 static unsigned pct_to_level(unsigned pct) {
     pct = clamp_pct(pct);
-    if (pct == 0) return 0;
-    if (pct <= 33) return 1;
-    if (pct <= 66) return 2;
+    if (pct <= 16) return 0;
+    if (pct <= 50) return 1;
+    if (pct <= 83) return 2;
     return 3;
 }
 
 static unsigned level_to_qmk_pct(unsigned level) {
     switch (level) {
         case 0: return 0;
-        case 1: return 33;
-        case 2: return 66;
+        case 1: return 35; // Use 35 instead of 33 to avoid 0% revert flakiness
+        case 2: return 67;
         default: return 100;
     }
 }
@@ -125,9 +129,8 @@ typedef struct {
     char name[64];
     target_t targets[16];
     size_t targets_len;
+    target_t master;
     unsigned last_level;
-    unsigned pending_level;
-    uint64_t deadline;
 } uled_ctx_t;
 
 static int target_eq(const target_t *a, const target_t *b) {
@@ -161,12 +164,25 @@ static int qmk_set(uint16_t vid, uint16_t pid, unsigned pct) {
         NULL
     };
 
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    int fd = open("/dev/null", O_WRONLY);
+    if (fd >= 0) {
+        posix_spawn_file_actions_adddup2(&actions, fd, STDOUT_FILENO);
+        posix_spawn_file_actions_adddup2(&actions, fd, STDERR_FILENO);
+        posix_spawn_file_actions_addclose(&actions, fd);
+    }
+
     pid_t p;
-    int rc = posix_spawn(&p, qmk, NULL, NULL, argv, environ);
+    int rc = posix_spawn(&p, qmk, &actions, NULL, argv, environ);
     if (rc != 0) {
         dbg(2, "qmk_hid spawn failed rc=%d\n", rc);
+        posix_spawn_file_actions_destroy(&actions);
+        if (fd >= 0) close(fd);
         return -1;
     }
+    posix_spawn_file_actions_destroy(&actions);
+    if (fd >= 0) close(fd);
 
     int status = 0;
     if (waitpid(p, &status, 0) < 0) {
@@ -181,11 +197,157 @@ static int qmk_set(uint16_t vid, uint16_t pid, unsigned pct) {
     return -1;
 }
 
-static void qmk_apply_all(const target_t *targets, size_t len, unsigned level) {
+static void qmk_apply_all(const target_t *targets, size_t len, unsigned level, const target_t *skip) {
     unsigned pct = level_to_qmk_pct(level);
     dbg(2, "apply level=%u pct=%u to %zu targets\n", level, pct, len);
     for (size_t i = 0; i < len; i++) {
+        if (skip && target_eq(&targets[i], skip)) continue;
         (void)qmk_set(targets[i].vid, targets[i].pid, pct);
+    }
+}
+
+static int qmk_get(uint16_t vid, uint16_t pid) {
+    const char *qmk = "/usr/bin/qmk_hid";
+    char vid_s[8], pid_s[8];
+    snprintf(vid_s, sizeof(vid_s), "%04x", vid);
+    snprintf(pid_s, sizeof(pid_s), "%04x", pid);
+
+    char *argv[] = { (char *)qmk, (char *)"--vid", vid_s, (char *)"--pid", pid_s, (char *)"via", (char *)"--backlight", NULL };
+
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return -1;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+    posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+
+    pid_t p;
+    if (posix_spawn(&p, qmk, &actions, NULL, argv, environ) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipefd[1]);
+
+    char buf[128];
+    ssize_t n = read(pipefd[0], buf, sizeof(buf)-1);
+    close(pipefd[0]);
+    
+    int status;
+    waitpid(p, &status, 0);
+
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+
+    char *ptr = strstr(buf, "Brightness: ");
+    if (!ptr) return -1;
+    return atoi(ptr + 12);
+}
+
+
+static void update_sysfs_brightness(const char *name, unsigned val) {
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/leds/%s/brightness", name);
+    for (int i = 0; i < 10; i++) {
+        int fd = open(path, O_WRONLY);
+        if (fd >= 0) {
+            char buf[16];
+            int n = snprintf(buf, sizeof(buf), "%u\n", val);
+            (void)write(fd, buf, n);
+            close(fd);
+
+            // Trigger uevent so Powerdevil/UPower notice the change
+            snprintf(path, sizeof(path), "/sys/class/leds/%s/uevent", name);
+            fd = open(path, O_WRONLY);
+            if (fd >= 0) {
+                (void)write(fd, "change\n", 7);
+                close(fd);
+            }
+            return;
+        }
+        if (errno != ENOENT) break;
+        usleep(10000); // Wait 10ms for sysfs to catch up
+    }
+}
+
+static void sync_ui(unsigned level) {
+    // Synchronize UI via UPower (system bus) and KDE PowerDevil (session bus).
+    int debug = debug_level();
+    dbg(1, "syncing UI to level %u (sd-bus)\n", level);
+
+    // 1. System Bus (UPower)
+    if (fork() == 0) {
+        sd_bus *bus = NULL;
+        int r = sd_bus_open_system(&bus);
+        if (r >= 0) {
+            sd_bus_message *m = NULL;
+            r = sd_bus_call_method(bus, "org.freedesktop.UPower", "/org/freedesktop/UPower",
+                                   "org.freedesktop.UPower", "EnumerateKbdBacklights", NULL, &m, "");
+            if (r >= 0) {
+                char **paths;
+                if (sd_bus_message_read_strv(m, &paths) >= 0 && paths) {
+                    for (char **p = paths; *p; p++) {
+                        if (debug >= 3) dbg(3, "  UPower sync: %s\n", *p);
+                        sd_bus_call_method(bus, "org.freedesktop.UPower", *p,
+                                           "org.freedesktop.UPower.KbdBacklight", "SetBrightness", NULL, NULL, "i", (int32_t)level);
+                    }
+                }
+                sd_bus_message_unref(m);
+            }
+            sd_bus_unref(bus);
+        }
+        exit(0);
+    }
+
+    // 2. Session Buses (PowerDevil)
+    DIR *d = opendir("/run/user");
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d))) {
+            if (de->d_name[0] == '.') continue;
+            uid_t uid = (uid_t)atoi(de->d_name);
+            if (uid == 0) continue;
+
+            char socket_path[512];
+            snprintf(socket_path, sizeof(socket_path), "/run/user/%u/bus", uid);
+            struct stat st;
+            if (stat(socket_path, &st) != 0 || !S_ISSOCK(st.st_mode)) continue;
+
+            if (fork() == 0) {
+                struct passwd *pw = getpwuid(uid);
+                if (pw && setresuid(uid, uid, uid) == 0) {
+                    setenv("HOME", pw->pw_dir, 1);
+                    setenv("USER", pw->pw_name, 1);
+                    char address[528];
+                    snprintf(address, sizeof(address), "unix:path=%s", socket_path);
+                    setenv("DBUS_SESSION_BUS_ADDRESS", address, 1);
+
+                    sd_bus *sbus = NULL;
+                    int r = sd_bus_open_user(&sbus);
+                    if (r >= 0) {
+                        if (debug >= 3) dbg(3, "  PowerDevil sync for user %u (%s)\n", uid, pw->pw_name);
+                        sd_bus_error error = SD_BUS_ERROR_NULL;
+                        r = sd_bus_call_method(sbus, "org.kde.org_kde_powerdevil",
+                                               "/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl",
+                                               "org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl",
+                                               "setKeyboardBrightness", &error, NULL, "i", (int32_t)level);
+                        if (r < 0 && debug >= 3)
+                            dbg(3, "    PowerDevil call failed for user %u: %s\n", uid, error.message);
+                        sd_bus_error_free(&error);
+                        sd_bus_flush(sbus);
+                        sd_bus_unref(sbus);
+                    } else if (debug >= 3) {
+                        dbg(3, "    sd_bus_open_user failed for user %u: %s\n", uid, strerror(-r));
+                    }
+                }
+                exit(0);
+            }
+        }
+        closedir(d);
     }
 }
 
@@ -307,16 +469,16 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -m, --mode <mode>              Operation mode: 'unified' (default) or 'separate'\n");
     fprintf(stderr, "  -v, --vid <list>               Comma-separated VIDs or VID:PID (default: 32ac)\n");
-    fprintf(stderr, "  -d, --debounce-ms <ms>         Debounce time in milliseconds (default: 180)\n");
-    fprintf(stderr, "  -b, --max-brightness <val>     Maximum brightness value (default: 100)\n");
+    fprintf(stderr, "  -b, --max-brightness <val>     Maximum brightness value (default: 3)\n");
+    fprintf(stderr, "  -p, --poll-ms <ms>             Hardware polling interval (default: 1000)\n");
     fprintf(stderr, "  -l, --list                     List auto-discovered devices and exit\n");
     fprintf(stderr, "  -h, --help                     Show this help message\n");
     fprintf(stderr, "\nEnvironment Variables:\n");
-    fprintf(stderr, "  FW16_KBD_ULEDS_DEBUG           Debug level: 0 (default), 1 (info), 2 (verbose)\n");
+    fprintf(stderr, "  FW16_KBD_ULEDS_DEBUG           Debug level: 0 (default), 1 (info), 2 (verbose), 3 (D-Bus)\n");
     fprintf(stderr, "  FW16_KBD_ULEDS_MODE            Same as --mode\n");
     fprintf(stderr, "  FW16_KBD_ULEDS_VID             Same as --vid\n");
-    fprintf(stderr, "  FW16_KBD_ULEDS_DEBOUNCE_MS     Same as --debounce-ms\n");
     fprintf(stderr, "  FW16_KBD_ULEDS_MAX_BRIGHTNESS  Same as --max-brightness\n");
+    fprintf(stderr, "  FW16_KBD_ULEDS_POLL_MS         Same as --poll-ms\n");
 }
 
 typedef enum {
@@ -348,13 +510,14 @@ static const char *type_names[] = {
 /* -------------------- Main -------------------- */
 
 int main(int argc, char **argv) {
+    signal(SIGCHLD, SIG_IGN);
     fw_mode_t mode = FW_MODE_UNIFIED;
     uint16_t vids[8];
     size_t num_vids = 0;
     target_t manual_targets[16];
     size_t num_manual_targets = 0;
-    unsigned debounce_ms = 180;
-    unsigned max_brightness = 100;
+    unsigned max_brightness = 3;
+    unsigned poll_ms = 1000;
 
     // Default VID
     vids[num_vids++] = 0x32ac;
@@ -382,17 +545,17 @@ int main(int argc, char **argv) {
         free(dup);
     }
 
-    const char *env_debounce = getenv("FW16_KBD_ULEDS_DEBOUNCE_MS");
-    if (env_debounce) debounce_ms = (unsigned)strtoul(env_debounce, NULL, 10);
-
     const char *env_max_brightness = getenv("FW16_KBD_ULEDS_MAX_BRIGHTNESS");
     if (env_max_brightness) max_brightness = (unsigned)strtoul(env_max_brightness, NULL, 10);
+
+    const char *env_poll = getenv("FW16_KBD_ULEDS_POLL_MS");
+    if (env_poll) poll_ms = (unsigned)strtoul(env_poll, NULL, 10);
 
     static struct option opts[] = {
         {"mode", required_argument, 0, 'm'},
         {"vid", required_argument, 0, 'v'},
-        {"debounce-ms", required_argument, 0, 'd'},
         {"max-brightness", required_argument, 0, 'b'},
+        {"poll-ms", required_argument, 0, 'p'},
         {"list", no_argument, 0, 'l'},
         {"help", no_argument, 0, 'h'},
         {0,0,0,0}
@@ -400,7 +563,7 @@ int main(int argc, char **argv) {
 
     int c;
     int do_list = 0;
-    while ((c = getopt_long(argc, argv, "m:v:d:b:lh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "m:v:b:p:lh", opts, NULL)) != -1) {
         switch (c) {
             case 'm': mode = parse_mode(optarg); break;
             case 'v': {
@@ -422,8 +585,8 @@ int main(int argc, char **argv) {
                 free(dup);
                 break;
             }
-            case 'd': debounce_ms = (unsigned)strtoul(optarg, NULL, 10); break;
             case 'b': max_brightness = (unsigned)strtoul(optarg, NULL, 10); break;
+            case 'p': poll_ms = (unsigned)strtoul(optarg, NULL, 10); break;
             case 'l': do_list = 1; break;
             case 'h': usage(argv[0]); return 0;
             default: usage(argv[0]); return 1;
@@ -510,8 +673,35 @@ int main(int argc, char **argv) {
             ctxs[i].fd = create_uleds_led(ctxs[i].name, max_brightness);
             if (ctxs[i].fd < 0) return 1;
             num_ctxs++;
-            // Apply start state
-            qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, 0);
+
+            // Find master target for polling (prefer keyboard)
+            ctxs[i].master = ctxs[i].targets[0];
+            for (size_t j = 0; j < ctxs[i].targets_len; j++) {
+                if (get_type(ctxs[i].targets[j].pid) == 0) {
+                    ctxs[i].master = ctxs[i].targets[j];
+                    break;
+                }
+            }
+
+            // Sync with current hardware state (with retry)
+            int pct = -1;
+            for (int r = 0; r < 5; r++) {
+                pct = qmk_get(ctxs[i].master.vid, ctxs[i].master.pid);
+                if (pct >= 0) break;
+                usleep(200000); // 200ms
+            }
+            unsigned level = (pct >= 0) ? pct_to_level((unsigned)pct) : 0;
+            ctxs[i].last_level = level;
+            dbg(1, "initial state [%s]: %d%% (level %u) master=%04x:%04x\n", 
+                ctxs[i].name, pct, level, ctxs[i].master.vid, ctxs[i].master.pid);
+            
+            // Immediately sync sysfs and other modules if needed
+            update_sysfs_brightness(ctxs[i].name, (level * max_brightness) / 3);
+            if (ctxs[i].targets_len > 1) {
+                qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, NULL);
+            }
+            // Sync UPower state to match initial hardware level
+            sync_ui(level);
         }
     }
 
@@ -531,17 +721,14 @@ int main(int argc, char **argv) {
         dbg(1, "hotplug: listening for uevents\n");
     }
 
+    uint64_t next_hw_poll = now_ms() + 500;
     struct pollfd pfds[5]; // up to 4 uleds + 1 uevent
     for (;;) {
         uint64_t now = now_ms();
         int timeout = -1;
 
-        for (int i = 0; i < 4; i++) {
-            if (ctxs[i].fd >= 0 && ctxs[i].deadline > 0) {
-                int t = (ctxs[i].deadline <= now) ? 0 : (int)(ctxs[i].deadline - now);
-                if (timeout == -1 || t < timeout) timeout = t;
-            }
-        }
+        int hw_t = (next_hw_poll <= now) ? 0 : (int)(next_hw_poll - now);
+        timeout = hw_t;
 
         int pidx = 0;
         for (int i = 0; i < 4; i++) {
@@ -570,15 +757,27 @@ int main(int argc, char **argv) {
 
         now = now_ms();
 
-        // Debounce expiries
-        for (int i = 0; i < 4; i++) {
-            if (ctxs[i].fd >= 0 && ctxs[i].deadline > 0 && ctxs[i].deadline <= now) {
-                if (ctxs[i].pending_level != ctxs[i].last_level) {
-                    qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, ctxs[i].pending_level);
-                    ctxs[i].last_level = ctxs[i].pending_level;
+        // Hardware polling
+        if (now >= next_hw_poll) {
+            for (int i = 0; i < 4; i++) {
+                if (ctxs[i].fd >= 0) {
+                    int pct = qmk_get(ctxs[i].master.vid, ctxs[i].master.pid);
+                    if (pct >= 0) {
+                        unsigned level = pct_to_level((unsigned)pct);
+                        if (level != ctxs[i].last_level) {
+                            dbg(1, "hardware change detected on [%s] (via %04x:%04x): %u -> %u\n", 
+                                ctxs[i].name, ctxs[i].master.vid, ctxs[i].master.pid, ctxs[i].last_level, level);
+                            ctxs[i].last_level = level;
+                            // Apply to all OTHER targets in this context to keep them in sync
+                            // We skip the master because it already changed at the hardware level
+                            qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, &ctxs[i].master);
+                            update_sysfs_brightness(ctxs[i].name, (level * max_brightness) / 3);
+                            sync_ui(level);
+                        }
+                    }
                 }
-                ctxs[i].deadline = 0;
             }
+            next_hw_poll = now + poll_ms;
         }
 
         // uleds events
@@ -590,10 +789,13 @@ int main(int argc, char **argv) {
                     ssize_t r = read(ctxs[i].fd, buf, sizeof(buf));
                     if (r > 0) {
                         unsigned raw = decode_uleds(buf, r);
-                        unsigned level = pct_to_level(raw);
-                        ctxs[i].pending_level = level;
-                        ctxs[i].deadline = now + debounce_ms;
-                        dbg(2, "event [%s]: raw=%u level=%u\n", ctxs[i].name, raw, level);
+                        unsigned level = pct_to_level((raw * 100) / max_brightness);
+                        dbg(2, "event [%s]: raw=%u max=%u level=%u last=%u\n", 
+                            ctxs[i].name, raw, max_brightness, level, ctxs[i].last_level);
+                        if (level != ctxs[i].last_level) {
+                            qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, NULL);
+                            ctxs[i].last_level = level;
+                        }
                     }
                 }
                 pidx++;

@@ -7,9 +7,9 @@ UNITDIR ?= $(PREFIX)/lib/systemd/system
 TARGET := fw16-kbd-uleds
 SRC := fw16-kbd-uleds.c
 
-CFLAGS += -Wall -Wextra
+CFLAGS += -Wall -Wextra $(shell pkg-config --cflags libsystemd 2>/dev/null)
 CPPFLAGS ?=
-LDFLAGS ?=
+LDFLAGS += $(shell pkg-config --libs libsystemd 2>/dev/null)
 
 .PHONY: all clean install uninstall
 
@@ -29,3 +29,4 @@ clean:
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/$(TARGET)"
 	rm -f "$(DESTDIR)$(UNITDIR)/fw16-kbd-uleds.service"
+	rm -f "$(DESTDIR)$(PREFIX)/share/licenses/$(TARGET)/LICENSE"
