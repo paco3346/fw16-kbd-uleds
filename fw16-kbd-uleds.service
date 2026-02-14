@@ -1,5 +1,5 @@
 [Unit]
-Description=Framework 16 keyboard uleds bridge (framework::kbd_backlight -> qmk_hid)
+Description=Framework 16 keyboard uleds bridge (framework::kbd_backlight -> HIDRAW)
 After=local-fs.target systemd-modules-load.service
 Before=display-manager.service
 

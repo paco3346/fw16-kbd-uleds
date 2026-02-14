@@ -3,7 +3,7 @@
 Framework Laptop 16 keyboard backlight bridge for KDE/UPower.
 
 This tool creates a virtual LED device via `/dev/uleds` named `framework::kbd_backlight`.
-Brightness changes from the desktop environment are translated into calls to `qmk_hid` and applied to detected Framework 16 keyboard, numpad, and RGB macropad modules.
+Brightness changes from the desktop environment are translated into direct QMK/VIA HID commands and applied to detected Framework 16 keyboard, numpad, and RGB macropad modules.
 
 ## Features
 
@@ -14,9 +14,8 @@ Brightness changes from the desktop environment are translated into calls to `qm
 
 ## Requirements
 
-- Linux kernel with `uleds` module support.
-- `qmk_hid` installed at `/usr/bin/qmk_hid`.
-- `libsystemd` (for D-Bus synchronization).
+- Linux kernel with `uleds` and `hidraw` module support.
+- `libsystemd` (for native D-Bus synchronization).
 - `systemd` (for the provided service unit).
 
 ## Installation
@@ -133,3 +132,7 @@ Environment=FW16_KBD_ULEDS_DEBUG=2
 ## License
 
 MIT
+
+## Acknowledgements
+
+The QMK/VIA HID protocol implementation was gleaned from [Framework's qmk_hid repository](https://github.com/FrameworkComputer/qmk_hid).

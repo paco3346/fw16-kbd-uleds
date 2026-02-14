@@ -27,7 +27,7 @@
 //
 // Requires:
 //   - kernel module: uleds
-//   - /usr/bin/qmk_hid (FrameworkComputer/qmk_hid)
+//   - libsystemd (for D-Bus synchronization)
 
 #define _GNU_SOURCE
 
@@ -40,7 +40,6 @@
 #include <poll.h>
 #include <pwd.h>
 #include <signal.h>
-#include <spawn.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,27 +48,26 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <linux/hidraw.h>
 #include <systemd/sd-bus.h>
 #include <time.h>
 #include <unistd.h>
 
-extern char **environ;
+
+// QMK/VIA HID protocol constants (gleaned from Framework's qmk_hid)
+#define QMK_CMD_SET_VALUE 0x07
+#define QMK_CMD_GET_VALUE 0x08
+#define QMK_CH_BACKLIGHT 0x01
+#define QMK_CH_RGB_MATRIX 0x03
+#define QMK_ADDR_BRIGHTNESS 0x01
 
 /* -------------------- Debug -------------------- */
 
-static int debug_level(void) {
-    const char *e = getenv("FW16_KBD_ULEDS_DEBUG");
-    if (!e || !*e) return 0;
-    char *end = NULL;
-    long v = strtol(e, &end, 10);
-    if (end == e) return 0;
-    if (v < 0) v = 0;
-    if (v > 3) v = 3;
-    return (int)v;
-}
+static int g_debug_level = 0;
 
 static void dbg(int lvl, const char *fmt, ...) {
-    if (debug_level() < lvl) return;
+    if (g_debug_level < lvl) return;
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -122,6 +120,7 @@ static unsigned decode_uleds(const unsigned char *buf, ssize_t r) {
 typedef struct {
     uint16_t vid;
     uint16_t pid;
+    char hidraw[64];
 } target_t;
 
 typedef struct {
@@ -145,56 +144,52 @@ static int target_in_list(const target_t *list, size_t len, const target_t *t) {
 }
 
 
-/* -------------------- qmk_hid -------------------- */
+/* -------------------- qmk HIDRAW -------------------- */
 
-static int qmk_set(uint16_t vid, uint16_t pid, unsigned pct) {
-    const char *qmk = "/usr/bin/qmk_hid";
+static int qmk_hidraw_xfer(const char *hidraw, unsigned char cmd, unsigned char channel, unsigned char addr, unsigned char val, unsigned char *resp) {
+    if (!hidraw || !*hidraw) return -1;
+    char path[128];
+    snprintf(path, sizeof(path), "/dev/%s", hidraw);
+    int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return -1;
 
-    char vid_s[8], pid_s[8], pct_s[8];
-    snprintf(vid_s, sizeof(vid_s), "%04x", vid);
-    snprintf(pid_s, sizeof(pid_s), "%04x", pid);
-    snprintf(pct_s, sizeof(pct_s), "%u", pct);
+    unsigned char buf[33];
+    memset(buf, 0, sizeof(buf));
+    buf[0] = 0x00;
+    buf[1] = cmd;
+    buf[2] = channel;
+    buf[3] = addr;
+    buf[4] = val;
 
-    char *argv[] = {
-        (char *)qmk,
-        (char *)"--vid", vid_s,
-        (char *)"--pid", pid_s,
-        (char *)"via",
-        (char *)"--backlight", pct_s,
-        NULL
-    };
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    int fd = open("/dev/null", O_WRONLY);
-    if (fd >= 0) {
-        posix_spawn_file_actions_adddup2(&actions, fd, STDOUT_FILENO);
-        posix_spawn_file_actions_adddup2(&actions, fd, STDERR_FILENO);
-        posix_spawn_file_actions_addclose(&actions, fd);
-    }
-
-    pid_t p;
-    int rc = posix_spawn(&p, qmk, &actions, NULL, argv, environ);
-    if (rc != 0) {
-        dbg(2, "qmk_hid spawn failed rc=%d\n", rc);
-        posix_spawn_file_actions_destroy(&actions);
-        if (fd >= 0) close(fd);
-        return -1;
-    }
-    posix_spawn_file_actions_destroy(&actions);
-    if (fd >= 0) close(fd);
-
-    int status = 0;
-    if (waitpid(p, &status, 0) < 0) {
-        dbg(2, "qmk_hid waitpid failed: %s\n", strerror(errno));
+    if (write(fd, buf, 33) != 33) {
+        close(fd);
         return -1;
     }
 
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-        return 0;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    if (poll(&pfd, 1, 200) <= 0) {
+        close(fd);
+        return -1;
+    }
 
-    dbg(2, "qmk_hid failed vid=%04x pid=%04x\n", vid, pid);
-    return -1;
+    unsigned char r[32];
+    if (read(fd, r, 32) != 32) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if (r[0] != cmd) return -1;
+    if (resp) *resp = r[3];
+    return 0;
+}
+
+static int qmk_set(const target_t *t, unsigned pct) {
+    unsigned char val = (unsigned char)((pct * 255 + 50) / 100);
+    // Try both white backlight and RGB matrix
+    int r1 = qmk_hidraw_xfer(t->hidraw, QMK_CMD_SET_VALUE, QMK_CH_BACKLIGHT, QMK_ADDR_BRIGHTNESS, val, NULL);
+    int r2 = qmk_hidraw_xfer(t->hidraw, QMK_CMD_SET_VALUE, QMK_CH_RGB_MATRIX, QMK_ADDR_BRIGHTNESS, val, NULL);
+    return (r1 == 0 || r2 == 0) ? 0 : -1;
 }
 
 static void qmk_apply_all(const target_t *targets, size_t len, unsigned level, const target_t *skip) {
@@ -202,50 +197,19 @@ static void qmk_apply_all(const target_t *targets, size_t len, unsigned level, c
     dbg(2, "apply level=%u pct=%u to %zu targets\n", level, pct, len);
     for (size_t i = 0; i < len; i++) {
         if (skip && target_eq(&targets[i], skip)) continue;
-        (void)qmk_set(targets[i].vid, targets[i].pid, pct);
+        (void)qmk_set(&targets[i], pct);
     }
 }
 
-static int qmk_get(uint16_t vid, uint16_t pid) {
-    const char *qmk = "/usr/bin/qmk_hid";
-    char vid_s[8], pid_s[8];
-    snprintf(vid_s, sizeof(vid_s), "%04x", vid);
-    snprintf(pid_s, sizeof(pid_s), "%04x", pid);
-
-    char *argv[] = { (char *)qmk, (char *)"--vid", vid_s, (char *)"--pid", pid_s, (char *)"via", (char *)"--backlight", NULL };
-
-    int pipefd[2];
-    if (pipe(pipefd) < 0) return -1;
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addclose(&actions, pipefd[0]);
-    posix_spawn_file_actions_addclose(&actions, pipefd[1]);
-
-    pid_t p;
-    if (posix_spawn(&p, qmk, &actions, NULL, argv, environ) != 0) {
-        posix_spawn_file_actions_destroy(&actions);
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return -1;
+static int qmk_get(const target_t *t) {
+    unsigned char val = 0;
+    if (qmk_hidraw_xfer(t->hidraw, QMK_CMD_GET_VALUE, QMK_CH_BACKLIGHT, QMK_ADDR_BRIGHTNESS, 0, &val) == 0) {
+        return (int)((val * 100 + 127) / 255);
     }
-    posix_spawn_file_actions_destroy(&actions);
-    close(pipefd[1]);
-
-    char buf[128];
-    ssize_t n = read(pipefd[0], buf, sizeof(buf)-1);
-    close(pipefd[0]);
-    
-    int status;
-    waitpid(p, &status, 0);
-
-    if (n <= 0) return -1;
-    buf[n] = '\0';
-
-    char *ptr = strstr(buf, "Brightness: ");
-    if (!ptr) return -1;
-    return atoi(ptr + 12);
+    if (qmk_hidraw_xfer(t->hidraw, QMK_CMD_GET_VALUE, QMK_CH_RGB_MATRIX, QMK_ADDR_BRIGHTNESS, 0, &val) == 0) {
+        return (int)((val * 100 + 127) / 255);
+    }
+    return -1;
 }
 
 
@@ -276,7 +240,6 @@ static void update_sysfs_brightness(const char *name, unsigned val) {
 
 static void sync_ui(unsigned level) {
     // Synchronize UI via UPower (system bus) and KDE PowerDevil (session bus).
-    int debug = debug_level();
     dbg(1, "syncing UI to level %u (sd-bus)\n", level);
 
     // 1. System Bus (UPower)
@@ -291,7 +254,7 @@ static void sync_ui(unsigned level) {
                 char **paths;
                 if (sd_bus_message_read_strv(m, &paths) >= 0 && paths) {
                     for (char **p = paths; *p; p++) {
-                        if (debug >= 3) dbg(3, "  UPower sync: %s\n", *p);
+                        if (g_debug_level >= 3) dbg(3, "  UPower sync: %s\n", *p);
                         sd_bus_call_method(bus, "org.freedesktop.UPower", *p,
                                            "org.freedesktop.UPower.KbdBacklight", "SetBrightness", NULL, NULL, "i", (int32_t)level);
                     }
@@ -329,18 +292,18 @@ static void sync_ui(unsigned level) {
                     sd_bus *sbus = NULL;
                     int r = sd_bus_open_user(&sbus);
                     if (r >= 0) {
-                        if (debug >= 3) dbg(3, "  PowerDevil sync for user %u (%s)\n", uid, pw->pw_name);
+                        if (g_debug_level >= 3) dbg(3, "  PowerDevil sync for user %u (%s)\n", uid, pw->pw_name);
                         sd_bus_error error = SD_BUS_ERROR_NULL;
                         r = sd_bus_call_method(sbus, "org.kde.org_kde_powerdevil",
                                                "/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl",
                                                "org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl",
                                                "setKeyboardBrightness", &error, NULL, "i", (int32_t)level);
-                        if (r < 0 && debug >= 3)
+                        if (r < 0 && g_debug_level >= 3)
                             dbg(3, "    PowerDevil call failed for user %u: %s\n", uid, error.message);
                         sd_bus_error_free(&error);
                         sd_bus_flush(sbus);
                         sd_bus_unref(sbus);
-                    } else if (debug >= 3) {
+                    } else if (g_debug_level >= 3) {
                         dbg(3, "    sd_bus_open_user failed for user %u: %s\n", uid, strerror(-r));
                     }
                 }
@@ -353,39 +316,57 @@ static void sync_ui(unsigned level) {
 
 /* -------------------- HID auto-detect via sysfs -------------------- */
 
-// Return 1 if a HID device with vid/pid appears present under /sys/bus/hid/devices, else 0.
-// Looks for uevent line like: HID_ID=0003:000032AC:00000012
-static int hid_present(uint16_t vid, uint16_t pid) {
-    DIR *d = opendir("/sys/bus/hid/devices");
-    if (!d) return 0;
-
-    char needle[64];
-    snprintf(needle, sizeof(needle), ":0000%04X:0000%04X", vid, pid);
+static int find_raw_hidraw(uint16_t vid, uint16_t pid, char *out, size_t out_len) {
+    DIR *d = opendir("/sys/class/hidraw");
+    if (!d) return -1;
 
     struct dirent *ent;
+    int found = 0;
     while ((ent = readdir(d))) {
         if (ent->d_name[0] == '.') continue;
 
         char path[512];
-        snprintf(path, sizeof(path), "/sys/bus/hid/devices/%s/uevent", ent->d_name);
+        snprintf(path, sizeof(path), "/sys/class/hidraw/%s/device/uevent", ent->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
 
-        int fd = open(path, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) continue;
-
-        char buf[4096];
-        ssize_t r = read(fd, buf, sizeof(buf) - 1);
-        close(fd);
-        if (r <= 0) continue;
-        buf[r] = '\0';
-
-        if (strstr(buf, needle)) {
-            closedir(d);
-            return 1;
+        char line[256];
+        uint16_t v = 0, p = 0;
+        int match = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "HID_ID=%*x:%hx:%hx", &v, &p) == 2) {
+                if (v == vid && p == pid) match = 1;
+                break;
+            }
         }
-    }
+        fclose(f);
 
+        if (match) {
+            // Check report descriptor for 0xFF60
+            snprintf(path, sizeof(path), "/dev/%s", ent->d_name);
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                int desc_size = 0;
+                if (ioctl(fd, HIDIOCGRDESCSIZE, &desc_size) >= 0) {
+                    struct hidraw_report_descriptor rpt;
+                    rpt.size = desc_size;
+                    if (ioctl(fd, HIDIOCGRDESC, &rpt) >= 0) {
+                        for (uint32_t i = 0; i < (uint32_t)rpt.size - 2; i++) {
+                            if (rpt.value[i] == 0x06 && rpt.value[i+1] == 0x60 && rpt.value[i+2] == 0xFF) {
+                                snprintf(out, out_len, "%s", ent->d_name);
+                                found = 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+                close(fd);
+            }
+        }
+        if (found) break;
+    }
     closedir(d);
-    return 0;
+    return found ? 0 : -1;
 }
 
 static void autodetect_targets(const uint16_t *vids, size_t num_vids, target_t *out, size_t *len, size_t cap) {
@@ -393,9 +374,11 @@ static void autodetect_targets(const uint16_t *vids, size_t num_vids, target_t *
 
     for (size_t v = 0; v < num_vids; v++) {
         for (size_t i = 0; i < sizeof(pids)/sizeof(pids[0]); i++) {
-            if (hid_present(vids[v], pids[i])) {
+            char hidraw[64] = "";
+            if (find_raw_hidraw(vids[v], pids[i], hidraw, sizeof(hidraw)) == 0) {
                 if (*len < cap) {
                     target_t t = { .vid = vids[v], .pid = pids[i] };
+                    snprintf(t.hidraw, sizeof(t.hidraw), "%s", hidraw);
                     if (!target_in_list(out, *len, &t)) {
                         out[*len] = t;
                         (*len)++;
@@ -510,6 +493,13 @@ static const char *type_names[] = {
 /* -------------------- Main -------------------- */
 
 int main(int argc, char **argv) {
+    const char *env_debug = getenv("FW16_KBD_ULEDS_DEBUG");
+    if (env_debug) {
+        g_debug_level = (int)strtol(env_debug, NULL, 10);
+        if (g_debug_level < 0) g_debug_level = 0;
+        if (g_debug_level > 3) g_debug_level = 3;
+    }
+
     signal(SIGCHLD, SIG_IGN);
     fw_mode_t mode = FW_MODE_UNIFIED;
     uint16_t vids[8];
@@ -536,7 +526,7 @@ int main(int argc, char **argv) {
             if (strchr(tok, ':')) {
                 uint16_t v = (uint16_t)strtoul(tok, NULL, 16);
                 uint16_t p = (uint16_t)strtoul(strchr(tok, ':') + 1, NULL, 16);
-                if (num_manual_targets < 16) manual_targets[num_manual_targets++] = (target_t){v, p};
+                if (num_manual_targets < 16) manual_targets[num_manual_targets++] = (target_t){v, p, ""};
             } else if (num_vids < 8) {
                 vids[num_vids++] = (uint16_t)strtoul(tok, NULL, 16);
             }
@@ -576,7 +566,7 @@ int main(int argc, char **argv) {
                     if (strchr(tok, ':')) {
                         uint16_t v = (uint16_t)strtoul(tok, NULL, 16);
                         uint16_t p = (uint16_t)strtoul(strchr(tok, ':') + 1, NULL, 16);
-                        if (num_manual_targets < 16) manual_targets[num_manual_targets++] = (target_t){v, p};
+                        if (num_manual_targets < 16) manual_targets[num_manual_targets++] = (target_t){v, p, ""};
                     } else if (num_vids < 8) {
                         vids[num_vids++] = (uint16_t)strtoul(tok, NULL, 16);
                     }
@@ -591,6 +581,11 @@ int main(int argc, char **argv) {
             case 'h': usage(argv[0]); return 0;
             default: usage(argv[0]); return 1;
         }
+    }
+
+    // Resolve manual targets hidraw nodes
+    for (size_t i = 0; i < num_manual_targets; i++) {
+        (void)find_raw_hidraw(manual_targets[i].vid, manual_targets[i].pid, manual_targets[i].hidraw, sizeof(manual_targets[i].hidraw));
     }
 
     if (do_list) {
@@ -610,7 +605,7 @@ int main(int argc, char **argv) {
                 printf("  [%zu] %04x:%04x (%s)\n", i + 1, disc[i].vid, disc[i].pid, type_names[type]);
                 
                 int n = snprintf(cli_arg + cli_pos, sizeof(cli_arg) - cli_pos, "%s%04x:%04x", (i == 0 ? "" : ","), disc[i].vid, disc[i].pid);
-                if (n > 0) cli_pos += n;
+                if (n > 0) cli_pos += (size_t)n;
             }
 
             printf("\nTo target these specifically, use:\n");
@@ -686,7 +681,7 @@ int main(int argc, char **argv) {
             // Sync with current hardware state (with retry)
             int pct = -1;
             for (int r = 0; r < 5; r++) {
-                pct = qmk_get(ctxs[i].master.vid, ctxs[i].master.pid);
+                pct = qmk_get(&ctxs[i].master);
                 if (pct >= 0) break;
                 usleep(200000); // 200ms
             }
@@ -761,7 +756,7 @@ int main(int argc, char **argv) {
         if (now >= next_hw_poll) {
             for (int i = 0; i < 4; i++) {
                 if (ctxs[i].fd >= 0) {
-                    int pct = qmk_get(ctxs[i].master.vid, ctxs[i].master.pid);
+                    int pct = qmk_get(&ctxs[i].master);
                     if (pct >= 0) {
                         unsigned level = pct_to_level((unsigned)pct);
                         if (level != ctxs[i].last_level) {
@@ -835,8 +830,8 @@ int main(int argc, char **argv) {
                         if (type == i && ctxs[i].targets_len < 16) {
                             target_t t = new_all[j];
                             if (!target_in_list(old_targets, old_targets_len, &t)) {
-                                dbg(1, "hotplug [%s]: new device %04x:%04x\n", ctxs[i].name, t.vid, t.pid);
-                                qmk_set(t.vid, t.pid, level_to_qmk_pct(ctxs[i].last_level));
+                                dbg(1, "hotplug [%s]: new device %04x:%04x (%s)\n", ctxs[i].name, t.vid, t.pid, t.hidraw);
+                                qmk_set(&t, level_to_qmk_pct(ctxs[i].last_level));
                             }
                             ctxs[i].targets[ctxs[i].targets_len++] = t;
                         }
