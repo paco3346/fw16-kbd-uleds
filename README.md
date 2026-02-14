@@ -21,7 +21,7 @@ Brightness changes from the desktop environment are translated into calls to `qm
 ## Installation
 
 ### AUR (Recommended for Arch Linux)
-This package is available in the AUR as `fw16-kbd-uleds`.
+This package is available in the AUR as `fw16-kbd-uleds-git`.
 
 ### Manual Build
 ```bash
@@ -45,11 +45,39 @@ The daemon can be configured via command-line options, environment variables, or
 
 | CLI Option | Environment Variable | Description | Default |
 |:---|:---|:---|:---|
-| `-m, --mode` | `FW16_KBD_ULEDS_MODE` | Operation mode: `auto` or `unified` | `auto` |
-| `-v, --vid` | `FW16_KBD_ULEDS_VID` | Vendor ID of the keyboard (hex) | `32ac` |
+| `-m, --mode` | `FW16_KBD_ULEDS_MODE` | Operation mode: `unified` or `separate` | `unified` |
+| `-v, --vid` | `FW16_KBD_ULEDS_VID` | Comma-separated VIDs or `VID:PID` (hex) | `32ac` |
 | `-d, --debounce-ms` | `FW16_KBD_ULEDS_DEBOUNCE_MS` | Debounce time in milliseconds | `180` |
 | `-b, --max-brightness` | `FW16_KBD_ULEDS_MAX_BRIGHTNESS` | Maximum brightness value | `100` |
 | | `FW16_KBD_ULEDS_DEBUG` | Debug level: `0` (Quiet), `1` (Info), `2` (Verbose) | `0` |
+
+### Operation Modes
+
+The mode determines how detected modules are presented to the system:
+
+- **`unified` (Default)**: Groups all modules under a single virtual LED device named `framework::kbd_backlight`. Brightness changes are synced across all detected modules.
+  - **KDE/Powerdevil Note**: KDE's `plasma-powerdevil` only supports a single keyboard backlight device. If you want to use the native KDE brightness slider and shortcuts, you **must** use `unified` mode.
+- **`separate`**: Creates individual virtual LED devices for different module types, allowing independent control:
+  - `framework::kbd_backlight` (Keyboards)
+  - `framework::numpad_backlight` (Numpad)
+  - `framework::macropad_backlight` (Macropad)
+  - While this mode exposes all modules to the system, Powerdevil will likely only "see" one of them (usually the main keyboard). Use this mode only if you plan to manage the modules via custom scripts or other tools.
+
+### Auto-Discovery and Target Overrides
+
+By default, the daemon scans for the following Product IDs under the Framework Vendor ID (`32ac`):
+- `0012`, `0018`, `0019`: Keyboards (ANSI, ISO, JIS)
+- `0014`: Numpad
+- `0013`: RGB Macropad
+
+#### Overriding Targets
+Use the `--vid` option or `FW16_KBD_ULEDS_VID` environment variable to customize which devices are controlled. You can provide a comma-separated list of Vendor IDs or specific `VID:PID` pairs.
+
+Example:
+```env
+# Only control the main keyboard and a specific macropad
+FW16_KBD_ULEDS_VID=32ac:0012,32ac:0013
+```
 
 ### Configuration File
 

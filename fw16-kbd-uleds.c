@@ -7,7 +7,7 @@
 // fw16-kbd-uleds.c
 //
 // Framework Laptop 16 backlight bridge for KDE/UPower.
-// Default mode: auto (detect present modules, unified slider).
+// Default mode: unified (detect present modules, unified slider).
 //
 // Hotplug:
 //   - Listens for kernel uevents (NETLINK_KOBJECT_UEVENT)
@@ -120,6 +120,16 @@ typedef struct {
     uint16_t pid;
 } target_t;
 
+typedef struct {
+    int fd;
+    char name[64];
+    target_t targets[16];
+    size_t targets_len;
+    unsigned last_level;
+    unsigned pending_level;
+    uint64_t deadline;
+} uled_ctx_t;
+
 static int target_eq(const target_t *a, const target_t *b) {
     return a->vid == b->vid && a->pid == b->pid;
 }
@@ -131,15 +141,6 @@ static int target_in_list(const target_t *list, size_t len, const target_t *t) {
     return 0;
 }
 
-static void print_targets(int lvl, const char *prefix, const target_t *list, size_t len) {
-    if (debug_level() < lvl) return;
-    fprintf(stderr, "%s", prefix);
-    for (size_t i = 0; i < len; i++) {
-        fprintf(stderr, "%s%04x:%04x", (i ? ", " : ""), list[i].vid, list[i].pid);
-    }
-    fprintf(stderr, "\n");
-    fflush(stderr);
-}
 
 /* -------------------- qmk_hid -------------------- */
 
@@ -225,19 +226,19 @@ static int hid_present(uint16_t vid, uint16_t pid) {
     return 0;
 }
 
-static void autodetect_targets(uint16_t vid, target_t *out, size_t *len, size_t cap) {
-    *len = 0;
-
-    // Known FW16 input-module PIDs (VID 32ac):
-    // keyboards: ANSI 0012, ISO 0018, JIS 0019
-    // aux:       numpad 0014, RGB macropad 0013
+static void autodetect_targets(const uint16_t *vids, size_t num_vids, target_t *out, size_t *len, size_t cap) {
     const uint16_t pids[] = { 0x0012, 0x0018, 0x0019, 0x0014, 0x0013 };
 
-    for (size_t i = 0; i < sizeof(pids)/sizeof(pids[0]); i++) {
-        if (hid_present(vid, pids[i])) {
-            if (*len < cap) {
-                out[*len] = (target_t){ .vid = vid, .pid = pids[i] };
-                (*len)++;
+    for (size_t v = 0; v < num_vids; v++) {
+        for (size_t i = 0; i < sizeof(pids)/sizeof(pids[0]); i++) {
+            if (hid_present(vids[v], pids[i])) {
+                if (*len < cap) {
+                    target_t t = { .vid = vids[v], .pid = pids[i] };
+                    if (!target_in_list(out, *len, &t)) {
+                        out[*len] = t;
+                        (*len)++;
+                    }
+                }
             }
         }
     }
@@ -304,8 +305,8 @@ static int uevent_maybe_relevant(const char *buf, ssize_t len) {
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options]\n", prog);
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  -m, --mode <mode>              Operation mode: 'auto' (default) or 'unified'\n");
-    fprintf(stderr, "  -v, --vid <hex>                Vendor ID of the keyboard (default: 32ac)\n");
+    fprintf(stderr, "  -m, --mode <mode>              Operation mode: 'unified' (default) or 'separate'\n");
+    fprintf(stderr, "  -v, --vid <list>               Comma-separated VIDs or VID:PID (default: 32ac)\n");
     fprintf(stderr, "  -d, --debounce-ms <ms>         Debounce time in milliseconds (default: 180)\n");
     fprintf(stderr, "  -b, --max-brightness <val>     Maximum brightness value (default: 100)\n");
     fprintf(stderr, "  -h, --help                     Show this help message\n");
@@ -318,31 +319,67 @@ static void usage(const char *prog) {
 }
 
 typedef enum {
-    FW_MODE_AUTO = 0,
-    FW_MODE_UNIFIED
+    FW_MODE_UNIFIED = 0,
+    FW_MODE_SEPARATE
 } fw_mode_t;
 
 static fw_mode_t parse_mode(const char *s) {
-    if (!s) return FW_MODE_AUTO;
-    if (!strcmp(s, "auto")) return FW_MODE_AUTO;
+    if (!s) return FW_MODE_UNIFIED;
+    if (!strcmp(s, "separate")) return FW_MODE_SEPARATE;
     if (!strcmp(s, "unified")) return FW_MODE_UNIFIED;
-    return FW_MODE_AUTO;
+    return FW_MODE_UNIFIED;
 }
+
+static int get_type(uint16_t pid) {
+    if (pid == 0x0012 || pid == 0x0018 || pid == 0x0019) return 0; // Kbd
+    if (pid == 0x0014) return 1; // Numpad
+    if (pid == 0x0013) return 2; // Macropad
+    return 3; // Misc
+}
+
+static const char *type_names[] = {
+    "framework::kbd_backlight",
+    "framework::numpad_backlight",
+    "framework::macropad_backlight",
+    "framework::aux_backlight"
+};
 
 /* -------------------- Main -------------------- */
 
 int main(int argc, char **argv) {
-    fw_mode_t mode = FW_MODE_AUTO;
-    uint16_t vid = 0x32ac;
+    fw_mode_t mode = FW_MODE_UNIFIED;
+    uint16_t vids[8];
+    size_t num_vids = 0;
+    target_t manual_targets[16];
+    size_t num_manual_targets = 0;
     unsigned debounce_ms = 180;
     unsigned max_brightness = 100;
+
+    // Default VID
+    vids[num_vids++] = 0x32ac;
 
     // Load from environment first
     const char *env_mode = getenv("FW16_KBD_ULEDS_MODE");
     if (env_mode) mode = parse_mode(env_mode);
 
     const char *env_vid = getenv("FW16_KBD_ULEDS_VID");
-    if (env_vid) vid = (uint16_t)strtoul(env_vid, NULL, 16);
+    if (env_vid) {
+        num_vids = 0;
+        char *dup = strdup(env_vid);
+        char *saveptr;
+        char *tok = strtok_r(dup, ",", &saveptr);
+        while (tok && (num_vids < 8 || num_manual_targets < 16)) {
+            if (strchr(tok, ':')) {
+                uint16_t v = (uint16_t)strtoul(tok, NULL, 16);
+                uint16_t p = (uint16_t)strtoul(strchr(tok, ':') + 1, NULL, 16);
+                if (num_manual_targets < 16) manual_targets[num_manual_targets++] = (target_t){v, p};
+            } else if (num_vids < 8) {
+                vids[num_vids++] = (uint16_t)strtoul(tok, NULL, 16);
+            }
+            tok = strtok_r(NULL, ",", &saveptr);
+        }
+        free(dup);
+    }
 
     const char *env_debounce = getenv("FW16_KBD_ULEDS_DEBOUNCE_MS");
     if (env_debounce) debounce_ms = (unsigned)strtoul(env_debounce, NULL, 10);
@@ -363,7 +400,25 @@ int main(int argc, char **argv) {
     while ((c = getopt_long(argc, argv, "m:v:d:b:h", opts, NULL)) != -1) {
         switch (c) {
             case 'm': mode = parse_mode(optarg); break;
-            case 'v': vid = (uint16_t)strtoul(optarg, NULL, 16); break;
+            case 'v': {
+                num_vids = 0;
+                num_manual_targets = 0;
+                char *dup = strdup(optarg);
+                char *saveptr;
+                char *tok = strtok_r(dup, ",", &saveptr);
+                while (tok && (num_vids < 8 || num_manual_targets < 16)) {
+                    if (strchr(tok, ':')) {
+                        uint16_t v = (uint16_t)strtoul(tok, NULL, 16);
+                        uint16_t p = (uint16_t)strtoul(strchr(tok, ':') + 1, NULL, 16);
+                        if (num_manual_targets < 16) manual_targets[num_manual_targets++] = (target_t){v, p};
+                    } else if (num_vids < 8) {
+                        vids[num_vids++] = (uint16_t)strtoul(tok, NULL, 16);
+                    }
+                    tok = strtok_r(NULL, ",", &saveptr);
+                }
+                free(dup);
+                break;
+            }
             case 'd': debounce_ms = (unsigned)strtoul(optarg, NULL, 10); break;
             case 'b': max_brightness = (unsigned)strtoul(optarg, NULL, 10); break;
             case 'h': usage(argv[0]); return 0;
@@ -372,71 +427,110 @@ int main(int argc, char **argv) {
     }
     if (max_brightness == 0) max_brightness = 100;
 
-    // Initial target discovery (auto/unified both discover at startup)
-    target_t targets[16];
-    size_t targets_len = 0;
-    autodetect_targets(vid, targets, &targets_len, sizeof(targets)/sizeof(targets[0]));
+    // Initial target discovery
+    target_t discovered[16];
+    size_t discovered_len = 0;
+    autodetect_targets(vids, num_vids, discovered, &discovered_len, 16);
 
-    if (targets_len == 0) {
-        fprintf(stderr, "No Framework HID targets detected (VID %04x)\n", vid);
+    // Merge manual and discovered
+    target_t all_targets[32];
+    size_t all_len = 0;
+    for (size_t i = 0; i < num_manual_targets && all_len < 32; i++) {
+        if (!target_in_list(all_targets, all_len, &manual_targets[i]))
+            all_targets[all_len++] = manual_targets[i];
+    }
+    for (size_t i = 0; i < discovered_len && all_len < 32; i++) {
+        if (!target_in_list(all_targets, all_len, &discovered[i]))
+            all_targets[all_len++] = discovered[i];
+    }
+
+    if (all_len == 0) {
+        fprintf(stderr, "No Framework HID targets detected\n");
         return 1;
     }
 
-    // Info logs: what we found
-    dbg(1, "autodetect: VID=%04x\n", vid);
-    for (size_t i = 0; i < targets_len; i++) {
-        uint16_t pid = targets[i].pid;
-        if (pid == 0x0012) dbg(1, "found keyboard: ANSI (32ac:0012)\n");
-        else if (pid == 0x0018) dbg(1, "found keyboard: ISO (32ac:0018)\n");
-        else if (pid == 0x0019) dbg(1, "found keyboard: JIS (32ac:0019)\n");
-        else if (pid == 0x0014) dbg(1, "found aux: numpad (32ac:0014)\n");
-        else if (pid == 0x0013) dbg(1, "found aux: RGB macropad (32ac:0013)\n");
-        else dbg(1, "found device: %04x:%04x\n", targets[i].vid, targets[i].pid);
-    }
-    print_targets(1, "targets: ", targets, targets_len);
+    // Initialize uleds contexts
+    uled_ctx_t ctxs[4];
+    size_t num_ctxs = 0;
+    memset(ctxs, 0, sizeof(ctxs));
 
-    // Create unified LED (must include "kbd_backlight" in the name for UPower)
-    int uleds_fd = create_uleds_led("framework::kbd_backlight", max_brightness);
-    if (uleds_fd < 0) return 1;
+    if (mode == FW_MODE_SEPARATE) {
+        for (size_t i = 0; i < all_len; i++) {
+            int type = get_type(all_targets[i].pid);
+            if (ctxs[type].targets_len == 0) {
+                snprintf(ctxs[type].name, sizeof(ctxs[type].name), "%s", type_names[type]);
+                ctxs[type].fd = -1;
+            }
+            if (ctxs[type].targets_len < 16) {
+                ctxs[type].targets[ctxs[type].targets_len++] = all_targets[i];
+            }
+        }
+    } else {
+        // Unified mode
+        snprintf(ctxs[0].name, sizeof(ctxs[0].name), "framework::kbd_backlight");
+        ctxs[0].fd = -1;
+        for (size_t i = 0; i < all_len && i < 16; i++) {
+            ctxs[0].targets[ctxs[0].targets_len++] = all_targets[i];
+        }
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if (ctxs[i].targets_len > 0) {
+            ctxs[i].fd = create_uleds_led(ctxs[i].name, max_brightness);
+            if (ctxs[i].fd < 0) return 1;
+            num_ctxs++;
+            // Apply start state
+            qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, 0);
+        }
+    }
+
+    // Info logs
+    dbg(1, "mode: %s, targets: %zu\n", (mode == FW_MODE_SEPARATE ? "separate" : "unified"), all_len);
+    for (int i = 0; i < 4; i++) {
+        if (ctxs[i].targets_len > 0) {
+            dbg(1, "uleds: %s (%zu targets)\n", ctxs[i].name, ctxs[i].targets_len);
+        }
+    }
 
     // Open uevent socket for hotplug
     int uev_fd = open_uevent_sock();
     if (uev_fd < 0) {
-        // Not fatal; hotplug just won't work.
         dbg(1, "warning: failed to open uevent socket; hotplug disabled (%s)\n", strerror(errno));
     } else {
         dbg(1, "hotplug: listening for uevents\n");
     }
 
-    // Apply consistent start state (off)
-    qmk_apply_all(targets, targets_len, 0);
-
-    unsigned last_level = 0;
-    unsigned pending_level = 0;
-    uint64_t deadline = 0;
-
-    struct pollfd pfds[2];
-    size_t pcount = (uev_fd >= 0) ? 2 : 1;
-
+    struct pollfd pfds[5]; // up to 4 uleds + 1 uevent
     for (;;) {
         uint64_t now = now_ms();
         int timeout = -1;
 
-        if (deadline > 0) {
-            timeout = (deadline <= now) ? 0 : (int)(deadline - now);
+        for (int i = 0; i < 4; i++) {
+            if (ctxs[i].fd >= 0 && ctxs[i].deadline > 0) {
+                int t = (ctxs[i].deadline <= now) ? 0 : (int)(ctxs[i].deadline - now);
+                if (timeout == -1 || t < timeout) timeout = t;
+            }
         }
 
-        pfds[0].fd = uleds_fd;
-        pfds[0].events = POLLIN;
-        pfds[0].revents = 0;
-
+        int pidx = 0;
+        for (int i = 0; i < 4; i++) {
+            if (ctxs[i].fd >= 0) {
+                pfds[pidx].fd = ctxs[i].fd;
+                pfds[pidx].events = POLLIN;
+                pfds[pidx].revents = 0;
+                pidx++;
+            }
+        }
+        int uev_idx = -1;
         if (uev_fd >= 0) {
-            pfds[1].fd = uev_fd;
-            pfds[1].events = POLLIN;
-            pfds[1].revents = 0;
+            uev_idx = pidx;
+            pfds[pidx].fd = uev_fd;
+            pfds[pidx].events = POLLIN;
+            pfds[pidx].revents = 0;
+            pidx++;
         }
 
-        int pr = poll(pfds, pcount, timeout);
+        int pr = poll(pfds, pidx, timeout);
         if (pr < 0) {
             if (errno == EINTR) continue;
             perror("poll");
@@ -445,72 +539,87 @@ int main(int argc, char **argv) {
 
         now = now_ms();
 
-        // Debounce expiry
-        if (pr == 0 && deadline > 0 && deadline <= now) {
-            if (pending_level != last_level) {
-                qmk_apply_all(targets, targets_len, pending_level);
-                last_level = pending_level;
-            }
-            deadline = 0;
-            continue;
-        }
-
-        // uleds brightness change
-        if (pfds[0].revents & POLLIN) {
-            unsigned char buf[8];
-            ssize_t r = read(uleds_fd, buf, sizeof(buf));
-            if (r > 0) {
-                unsigned raw = decode_uleds(buf, r);
-                unsigned level = pct_to_level(raw);
-                pending_level = level;
-                deadline = now + debounce_ms;
-                dbg(2, "event: raw=%u level=%u (read %zd bytes)\n", raw, level, r);
+        // Debounce expiries
+        for (int i = 0; i < 4; i++) {
+            if (ctxs[i].fd >= 0 && ctxs[i].deadline > 0 && ctxs[i].deadline <= now) {
+                if (ctxs[i].pending_level != ctxs[i].last_level) {
+                    qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, ctxs[i].pending_level);
+                    ctxs[i].last_level = ctxs[i].pending_level;
+                }
+                ctxs[i].deadline = 0;
             }
         }
 
-        // hotplug / uevent
-        if (uev_fd >= 0 && (pfds[1].revents & POLLIN)) {
+        // uleds events
+        pidx = 0;
+        for (int i = 0; i < 4; i++) {
+            if (ctxs[i].fd >= 0) {
+                if (pfds[pidx].revents & POLLIN) {
+                    unsigned char buf[8];
+                    ssize_t r = read(ctxs[i].fd, buf, sizeof(buf));
+                    if (r > 0) {
+                        unsigned raw = decode_uleds(buf, r);
+                        unsigned level = pct_to_level(raw);
+                        ctxs[i].pending_level = level;
+                        ctxs[i].deadline = now + debounce_ms;
+                        dbg(2, "event [%s]: raw=%u level=%u\n", ctxs[i].name, raw, level);
+                    }
+                }
+                pidx++;
+            }
+        }
+
+        // Hotplug
+        if (uev_idx >= 0 && (pfds[uev_idx].revents & POLLIN)) {
             char ubuf[8192];
             ssize_t r = recv(uev_fd, ubuf, sizeof(ubuf), 0);
             if (r > 0 && uevent_maybe_relevant(ubuf, r)) {
-                // Rescan (simple + robust)
-                target_t new_targets[16];
+                target_t new_all[32];
                 size_t new_len = 0;
-                autodetect_targets(vid, new_targets, &new_len, sizeof(new_targets)/sizeof(new_targets[0]));
 
-                // Diff
-                int changed = 0;
+                target_t disc[16];
+                size_t disc_len = 0;
+                autodetect_targets(vids, num_vids, disc, &disc_len, 16);
 
-                // Additions
-                for (size_t i = 0; i < new_len; i++) {
-                    if (!target_in_list(targets, targets_len, &new_targets[i])) {
-                        changed = 1;
-                        dbg(1, "hotplug: new device connected %04x:%04x\n", new_targets[i].vid, new_targets[i].pid);
-                        // Set new device to current brightness immediately
-                        (void)qmk_set(new_targets[i].vid, new_targets[i].pid, level_to_qmk_pct(last_level));
-                    }
+                for (size_t i = 0; i < num_manual_targets && new_len < 32; i++) {
+                    if (!target_in_list(new_all, new_len, &manual_targets[i]))
+                        new_all[new_len++] = manual_targets[i];
+                }
+                for (size_t i = 0; i < disc_len && new_len < 32; i++) {
+                    if (!target_in_list(new_all, new_len, &disc[i]))
+                        new_all[new_len++] = disc[i];
                 }
 
-                // Removals
-                for (size_t i = 0; i < targets_len; i++) {
-                    if (!target_in_list(new_targets, new_len, &targets[i])) {
-                        changed = 1;
-                        dbg(1, "hotplug: device removed %04x:%04x\n", targets[i].vid, targets[i].pid);
-                    }
-                }
+                // Simplified hotplug sync: just update targets in existing contexts
+                for (int i = 0; i < 4; i++) {
+                    size_t old_targets_len = ctxs[i].targets_len;
+                    target_t old_targets[16];
+                    memcpy(old_targets, ctxs[i].targets, sizeof(target_t) * old_targets_len);
+                    ctxs[i].targets_len = 0;
 
-                if (changed) {
-                    memcpy(targets, new_targets, sizeof(target_t) * new_len);
-                    targets_len = new_len;
-                    print_targets(1, "targets: ", targets, targets_len);
+                    for (size_t j = 0; j < new_len; j++) {
+                        int type = (mode == FW_MODE_SEPARATE) ? get_type(new_all[j].pid) : 0;
+                        if (type == i && ctxs[i].targets_len < 16) {
+                            target_t t = new_all[j];
+                            if (!target_in_list(old_targets, old_targets_len, &t)) {
+                                dbg(1, "hotplug [%s]: new device %04x:%04x\n", ctxs[i].name, t.vid, t.pid);
+                                qmk_set(t.vid, t.pid, level_to_qmk_pct(ctxs[i].last_level));
+                            }
+                            ctxs[i].targets[ctxs[i].targets_len++] = t;
+                        }
+                    }
+
+                    for (size_t j = 0; j < old_targets_len; j++) {
+                        if (!target_in_list(ctxs[i].targets, ctxs[i].targets_len, &old_targets[j])) {
+                            dbg(1, "hotplug [%s]: device removed %04x:%04x\n", ctxs[i].name, old_targets[j].vid, old_targets[j].pid);
+                        }
+                    }
                 }
             }
         }
     }
 
-    close(uleds_fd);
+    for (int i = 0; i < 4; i++) if (ctxs[i].fd >= 0) close(ctxs[i].fd);
     if (uev_fd >= 0) close(uev_fd);
-
-    (void)mode; // mode currently only affects default behavior; kept for future expansion.
     return 0;
 }
