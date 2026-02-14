@@ -309,6 +309,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -v, --vid <list>               Comma-separated VIDs or VID:PID (default: 32ac)\n");
     fprintf(stderr, "  -d, --debounce-ms <ms>         Debounce time in milliseconds (default: 180)\n");
     fprintf(stderr, "  -b, --max-brightness <val>     Maximum brightness value (default: 100)\n");
+    fprintf(stderr, "  -l, --list                     List auto-discovered devices and exit\n");
     fprintf(stderr, "  -h, --help                     Show this help message\n");
     fprintf(stderr, "\nEnvironment Variables:\n");
     fprintf(stderr, "  FW16_KBD_ULEDS_DEBUG           Debug level: 0 (default), 1 (info), 2 (verbose)\n");
@@ -392,12 +393,14 @@ int main(int argc, char **argv) {
         {"vid", required_argument, 0, 'v'},
         {"debounce-ms", required_argument, 0, 'd'},
         {"max-brightness", required_argument, 0, 'b'},
+        {"list", no_argument, 0, 'l'},
         {"help", no_argument, 0, 'h'},
         {0,0,0,0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "m:v:d:b:h", opts, NULL)) != -1) {
+    int do_list = 0;
+    while ((c = getopt_long(argc, argv, "m:v:d:b:lh", opts, NULL)) != -1) {
         switch (c) {
             case 'm': mode = parse_mode(optarg); break;
             case 'v': {
@@ -421,9 +424,37 @@ int main(int argc, char **argv) {
             }
             case 'd': debounce_ms = (unsigned)strtoul(optarg, NULL, 10); break;
             case 'b': max_brightness = (unsigned)strtoul(optarg, NULL, 10); break;
+            case 'l': do_list = 1; break;
             case 'h': usage(argv[0]); return 0;
             default: usage(argv[0]); return 1;
         }
+    }
+
+    if (do_list) {
+        target_t disc[16];
+        size_t disc_len = 0;
+        autodetect_targets(vids, num_vids, disc, &disc_len, 16);
+        
+        if (disc_len == 0) {
+            printf("No devices auto-discovered.\n");
+        } else {
+            printf("Auto-discovered devices:\n\n");
+            char cli_arg[256] = "";
+            size_t cli_pos = 0;
+
+            for (size_t i = 0; i < disc_len; i++) {
+                int type = get_type(disc[i].pid);
+                printf("  [%zu] %04x:%04x (%s)\n", i + 1, disc[i].vid, disc[i].pid, type_names[type]);
+                
+                int n = snprintf(cli_arg + cli_pos, sizeof(cli_arg) - cli_pos, "%s%04x:%04x", (i == 0 ? "" : ","), disc[i].vid, disc[i].pid);
+                if (n > 0) cli_pos += n;
+            }
+
+            printf("\nTo target these specifically, use:\n");
+            printf("  CLI:  -v %s\n", cli_arg);
+            printf("  Conf: FW16_KBD_ULEDS_VID=%s\n", cli_arg);
+        }
+        return 0;
     }
     if (max_brightness == 0) max_brightness = 100;
 

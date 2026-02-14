@@ -49,6 +49,7 @@ The daemon can be configured via command-line options, environment variables, or
 | `-v, --vid` | `FW16_KBD_ULEDS_VID` | Comma-separated VIDs or `VID:PID` (hex) | `32ac` |
 | `-d, --debounce-ms` | `FW16_KBD_ULEDS_DEBOUNCE_MS` | Debounce time in milliseconds | `180` |
 | `-b, --max-brightness` | `FW16_KBD_ULEDS_MAX_BRIGHTNESS` | Maximum brightness value | `100` |
+| `-l, --list` | | List auto-discovered devices and exit | |
 | | `FW16_KBD_ULEDS_DEBUG` | Debug level: `0` (Quiet), `1` (Info), `2` (Verbose) | `0` |
 
 ### Operation Modes
@@ -71,6 +72,13 @@ By default, the daemon scans for the following Product IDs under the Framework V
 - `0013`: RGB Macropad
 
 #### Overriding Targets
+You can use the `--list` (or `-l`) flag to see which devices are currently auto-discovered and get a copy-pasteable configuration string.
+
+Example discovery:
+```bash
+fw16-kbd-uleds --list
+```
+
 Use the `--vid` option or `FW16_KBD_ULEDS_VID` environment variable to customize which devices are controlled. You can provide a comma-separated list of Vendor IDs or specific `VID:PID` pairs.
 
 Example:
