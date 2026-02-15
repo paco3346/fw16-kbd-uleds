@@ -2,7 +2,7 @@
 pkgname=fw16-kbd-uleds-git
 pkgver=0
 pkgrel=1
-pkgdesc="Framework 16 keyboard backlight bridge for KDE/UPower - Git version"
+pkgdesc="Framework Laptop 16 QMK keyboard backlight bridge via UPower"
 arch=('x86_64')
 url="https://github.com/paco3346/fw16-kbd-uleds"
 license=('MIT')
