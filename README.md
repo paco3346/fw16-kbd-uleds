@@ -22,9 +22,6 @@ This daemon bridges that gap entirely in userspace.
 - **Runtime hotplug handling**: Uses `NETLINK_KOBJECT_UEVENT` to handle module changes at runtime.
 - **Configurable logging**: Adjustable debug levels via environment variables.
 
-> **KDE users:** Plasma PowerDevil only supports a single keyboard backlight device.
-> To use KDE’s native brightness slider and shortcuts, `unified` mode is required.
-
 ## Requirements
 
 - Linux kernel with `uleds` (userspace LED) and `hidraw` support
@@ -96,14 +93,14 @@ The mode determines how detected modules are presented to the system:
 
 * **`unified` (Default)**: Groups all modules under a single virtual LED device named `framework::kbd_backlight`. Brightness changes are synced across all detected modules.
 
-    * **KDE/PowerDevil Note**: KDE's `plasma-powerdevil` only supports a single keyboard backlight device. If you want to use the native KDE brightness slider and shortcuts, you must use `unified` mode.
+    * **KDE/PowerDevil Note**: KDE's `plasma-powerdevil` only supports a single keyboard backlight device. If you want to use the native KDE brightness slider and shortcuts to control more than just the main keyboard, you must use `unified` mode.
 * **`separate`**: Creates individual virtual LED devices for different module types, allowing independent control:
 
     * `framework::kbd_backlight` (Keyboards)
     * `framework::numpad_backlight` (Numpad)
     * `framework::macropad_backlight` (Macropad)
 
-  While this mode exposes all modules to the system, PowerDevil will likely only detect one of them (usually the last one alphabetically). Use this mode only if you plan to manage the modules via custom scripts or other tools.
+  While this mode exposes all modules to the system, PowerDevil will likely only detect one of them due to its string/name matching. Use this mode only if you plan to manage the modules via custom scripts or other tools.
 
 ### Hardware Synchronization
 
